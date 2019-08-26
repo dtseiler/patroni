@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from mock import patch, Mock
 from patroni.ctl import ctl, store_config, load_config, output_members, request_patroni, get_dcs, parse_dcs, \
     get_all_members, get_any_member, get_cursor, query_member, configure, PatroniCtlException, apply_config_changes, \
-    format_config_for_editing, show_diff, invoke_editor, format_pg_version
+    format_config_for_editing, show_diff, invoke_editor, format_pg_version, find_executable
 from patroni.dcs.etcd import Client, Failover
 from patroni.utils import tzutc
 from psycopg2 import OperationalError
@@ -25,9 +25,9 @@ CONFIG_FILE_PATH = './test-ctl.yaml'
 def test_rw_config():
     runner = CliRunner()
     with runner.isolated_filesystem():
-        store_config({'etcd': {'host': 'localhost:2379'}}, CONFIG_FILE_PATH + '/dummy')
         sys.argv = ['patronictl.py', '']
         load_config(CONFIG_FILE_PATH + '/dummy', None)
+        store_config({'etcd': {'host': 'localhost:2379'}}, CONFIG_FILE_PATH + '/dummy')
         load_config(CONFIG_FILE_PATH + '/dummy', '0.0.0.0')
         os.remove(CONFIG_FILE_PATH + '/dummy')
         os.rmdir(CONFIG_FILE_PATH)
@@ -90,8 +90,13 @@ class TestCtl(unittest.TestCase):
             result = self.runner.invoke(ctl, ['switchover', 'dummy', '--force', '--scheduled', '2015-01-01T12:00:00'])
             assert result.exit_code == 1
 
-        # Aborting switchover, as we anser NO to the confirmation
+        # Aborting switchover, as we answer NO to the confirmation
         result = self.runner.invoke(ctl, ['switchover', 'dummy'], input='leader\nother\n\nN')
+        assert result.exit_code == 1
+
+        # Aborting scheduled switchover, as we answer NO to the confirmation
+        result = self.runner.invoke(ctl, ['switchover', 'dummy', '--scheduled', '2015-01-01T12:00:00+01:00'],
+                                    input='leader\nother\n\nN')
         assert result.exit_code == 1
 
         # Target and source are equal
@@ -246,7 +251,7 @@ class TestCtl(unittest.TestCase):
     @patch('patroni.ctl.get_dcs')
     def test_restart_reinit(self, mock_get_dcs):
         mock_get_dcs.return_value.get_cluster = get_cluster_initialized_with_leader
-        result = self.runner.invoke(ctl, ['restart', 'alpha'], input='y\n\nnow')
+        result = self.runner.invoke(ctl, ['restart', 'alpha'], input='now\ny\n')
         assert 'Failed: restart for' in result.output
         assert result.exit_code == 0
 
@@ -258,18 +263,22 @@ class TestCtl(unittest.TestCase):
         assert result.exit_code == 0
 
         # Aborted restart
-        result = self.runner.invoke(ctl, ['restart', 'alpha'], input='N')
+        result = self.runner.invoke(ctl, ['restart', 'alpha'], input='now\nN')
         assert result.exit_code == 1
 
         result = self.runner.invoke(ctl, ['restart', 'alpha', '--pending', '--force'])
         assert result.exit_code == 0
 
+        # Aborted scheduled restart
+        result = self.runner.invoke(ctl, ['restart', 'alpha', '--scheduled', '2019-10-01T14:30'], input='N')
+        assert result.exit_code == 1
+
         # Not a member
-        result = self.runner.invoke(ctl, ['restart', 'alpha', 'dummy', '--any'], input='y')
+        result = self.runner.invoke(ctl, ['restart', 'alpha', 'dummy', '--any'], input='now\ny')
         assert result.exit_code == 1
 
         # Wrong pg version
-        result = self.runner.invoke(ctl, ['restart', 'alpha', '--any', '--pg-version', '9.1'], input='y')
+        result = self.runner.invoke(ctl, ['restart', 'alpha', '--any', '--pg-version', '9.1'], input='now\ny')
         assert 'Error: Invalid PostgreSQL version format' in result.output
         assert result.exit_code == 1
 
@@ -536,9 +545,10 @@ class TestCtl(unittest.TestCase):
 
     @patch('subprocess.call', return_value=1)
     def test_invoke_editor(self, mock_subprocess_call):
-        for e in ('', 'false'):
-            os.environ['EDITOR'] = e
-            self.assertRaises(PatroniCtlException, invoke_editor, 'foo: bar\n', 'test')
+        os.environ.pop('EDITOR', None)
+        for e in ('', '/bin/vi'):
+            with patch('patroni.ctl.find_executable', Mock(return_value=e)):
+                self.assertRaises(PatroniCtlException, invoke_editor, 'foo: bar\n', 'test')
 
     @patch('patroni.ctl.get_dcs')
     def test_show_config(self, mock_get_dcs):
@@ -577,3 +587,12 @@ class TestCtl(unittest.TestCase):
     def test_format_pg_version(self):
         self.assertEqual(format_pg_version(100001), '10.1')
         self.assertEqual(format_pg_version(90605), '9.6.5')
+
+    @patch('sys.platform', 'win32')
+    def test_find_executable(self):
+        with patch('os.path.isfile', Mock(return_value=True)):
+            self.assertEqual(find_executable('vim'), 'vim.exe')
+        with patch('os.path.isfile', Mock(return_value=False)):
+            self.assertIsNone(find_executable('vim'))
+        with patch('os.path.isfile', Mock(side_effect=[False, True])):
+            self.assertEqual(find_executable('vim', '/'), '/vim.exe')

@@ -25,7 +25,6 @@ import yaml
 
 from click import ClickException
 from contextlib import contextmanager
-from distutils.spawn import find_executable
 from patroni.config import Config
 from patroni.dcs import get_dcs as _get_dcs
 from patroni.exceptions import PatroniException
@@ -111,12 +110,16 @@ option_insecure = click.option('-k', '--insecure', is_flag=True, help='Allow con
 
 
 @click.group()
-@click.option('--config-file', '-c', help='Configuration file', default=CONFIG_FILE_PATH)
+@click.option('--config-file', '-c', help='Configuration file',
+              envvar='PATRONICTL_CONFIG_FILE', default=CONFIG_FILE_PATH)
 @click.option('--dcs', '-d', help='Use this DCS', envvar='DCS')
 @option_insecure
 @click.pass_context
 def ctl(ctx, config_file, dcs, insecure):
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=os.environ.get('LOGLEVEL', 'WARNING'))
+    level = 'WARNING'
+    for name in ('LOGLEVEL', 'PATRONI_LOGLEVEL', 'PATRONI_LOG_LEVEL'):
+        level = os.environ.get(name, level)
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=level)
     logging.captureWarnings(True)  # Capture eventual SSL warning
     ctx.obj = load_config(config_file, dcs)
     # backward compatibility for configuration file where ctl section is not define
@@ -268,7 +271,7 @@ def get_cursor(cluster, connect_parameters, role='master', member=None):
     return None
 
 
-def get_members(cluster, cluster_name, member_names, role, force, action):
+def get_members(cluster, cluster_name, member_names, role, force, action, scheduled_at=None):
     candidates = {m.name: m for m in cluster.members}
 
     if not force or role:
@@ -291,10 +294,18 @@ def get_members(cluster, cluster_name, member_names, role, force, action):
         if member_name not in candidates:
             raise PatroniCtlException('{0} is not a member of cluster'.format(member_name))
 
-    if not force:
-        confirm = click.confirm('Are you sure you want to {0} members {1}?'.format(action, ', '.join(member_names)))
-        if not confirm:
-            raise PatroniCtlException('Aborted {0}'.format(action))
+    if scheduled_at:
+        if not force:
+            confirm = click.confirm('Are you sure you want to schedule {0} of members {1} at {2}?'
+                                    .format(action, ', '.join(member_names), scheduled_at))
+            if not confirm:
+                raise PatroniCtlException('Aborted scheduled {0}'.format(action))
+    else:
+        if not force:
+            confirm = click.confirm('Are you sure you want to {0} members {1}?'
+                                    .format(action, ', '.join(member_names)))
+            if not confirm:
+                raise PatroniCtlException('Aborted {0}'.format(action))
 
     return [candidates[n] for n in member_names]
 
@@ -515,7 +526,14 @@ def reload(obj, cluster_name, member_names, force, role):
 def restart(obj, cluster_name, member_names, force, role, p_any, scheduled, version, pending, timeout):
     cluster = get_dcs(obj, cluster_name).get_cluster()
 
-    members = get_members(cluster, cluster_name, member_names, role, force, 'restart')
+    if scheduled is None and not force:
+        next_hour = (datetime.datetime.now() + datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M')
+        scheduled = click.prompt('When should the restart take place (e.g. ' + next_hour + ') ',
+                                 type=str, default='now')
+
+    scheduled_at = parse_scheduled(scheduled)
+
+    members = get_members(cluster, cluster_name, member_names, role, force, 'restart', scheduled_at)
     if p_any:
         random.shuffle(members)
         members = members[:1]
@@ -536,10 +554,6 @@ def restart(obj, cluster_name, member_names, force, role, p_any, scheduled, vers
 
         content['postgres_version'] = version
 
-    if scheduled is None and not force:
-        scheduled = click.prompt('When should the restart take place (e.g. 2015-10-01T14:30) ', type=str, default='now')
-
-    scheduled_at = parse_scheduled(scheduled)
     if scheduled_at:
         if cluster.is_paused():
             raise PatroniCtlException("Can't schedule restart in the paused state")
@@ -635,7 +649,8 @@ def _do_failover_or_switchover(obj, action, cluster_name, master, candidate, for
 
     if action == 'switchover':
         if scheduled is None and not force:
-            scheduled = click.prompt('When should the switchover take place (e.g. 2015-10-01T14:30) ',
+            next_hour = (datetime.datetime.now() + datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M')
+            scheduled = click.prompt('When should the switchover take place (e.g. ' + next_hour + ' ) ',
                                      type=str, default='now')
 
         scheduled_at = parse_scheduled(scheduled)
@@ -654,9 +669,14 @@ def _do_failover_or_switchover(obj, action, cluster_name, master, candidate, for
 
     if not force:
         demote_msg = ', demoting current master ' + master if master else ''
-
-        if not click.confirm('Are you sure you want to {0} cluster {1}{2}?'.format(action, cluster_name, demote_msg)):
-            raise PatroniCtlException('Aborting ' + action)
+        if scheduled_at_str:
+            if not click.confirm('Are you sure you want to schedule {0} of cluster {1} at {2}{3}?'
+                                 .format(action, cluster_name, scheduled_at_str, demote_msg)):
+                raise PatroniCtlException('Aborting scheduled ' + action)
+        else:
+            if not click.confirm('Are you sure you want to {0} cluster {1}{2}?'
+                                 .format(action, cluster_name, demote_msg)):
+                raise PatroniCtlException('Aborting ' + action)
 
     r = None
     try:
@@ -1086,15 +1106,33 @@ def apply_yaml_file(data, filename):
     return format_config_for_editing(changed_data), changed_data
 
 
+def find_executable(executable, path=None):
+    _, ext = os.path.splitext(executable)
+
+    if (sys.platform == 'win32') and (ext != '.exe'):
+        executable = executable + '.exe'
+
+    if os.path.isfile(executable):
+        return executable
+
+    if path is None:
+        path = os.environ.get('PATH', os.defpath)
+
+    for p in path.split(os.pathsep):
+        f = os.path.join(p, executable)
+        if os.path.isfile(f):
+            return f
+
+
 def invoke_editor(before_editing, cluster_name):
     """Starts editor command to edit configuration in human readable format
 
     :param before_editing: human representation before editing
     :returns tuple of human readable and parsed datastructure after changes
     """
-    if 'EDITOR' in os.environ:
-        editor_cmd = os.environ.get('EDITOR')
-    else:
+
+    editor_cmd = os.environ.get('EDITOR')
+    if not editor_cmd:
         for editor in ('editor', 'vi'):
             editor_cmd = find_executable(editor)
             if editor_cmd:
