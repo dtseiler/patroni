@@ -11,6 +11,20 @@ from threading import Lock, Thread
 _LOGGER = logging.getLogger(__name__)
 
 
+def debug_exception(logger_obj, msg, *args, **kwargs):
+    kwargs.pop("exc_info", False)
+    if logger_obj.isEnabledFor(logging.DEBUG):
+        logger_obj.debug(msg, *args, exc_info=True, **kwargs)
+    else:
+        msg = "{0}, DETAIL: '{1}'".format(msg, sys.exc_info()[1])
+        logger_obj.error(msg, *args, exc_info=False, **kwargs)
+
+
+def error_exception(logger_obj, msg, *args, **kwargs):
+    exc_info = kwargs.pop("exc_info", True)
+    logger_obj.error(msg, *args, exc_info=exc_info, **kwargs)
+
+
 class QueueHandler(logging.Handler):
 
     def __init__(self):
@@ -48,9 +62,20 @@ class QueueHandler(logging.Handler):
         return self._records_lost
 
 
+class ProxyHandler(logging.Handler):
+
+    def __init__(self, patroni_logger):
+        logging.Handler.__init__(self)
+        self.patroni_logger = patroni_logger
+
+    def emit(self, record):
+        self.patroni_logger.log_handler.handle(record)
+
+
 class PatroniLogger(Thread):
 
     DEFAULT_LEVEL = 'INFO'
+    DEFAULT_TRACEBACK_LEVEL = 'ERROR'
     DEFAULT_FORMAT = '%(asctime)s %(levelname)s: %(message)s'
 
     NORMAL_LOG_QUEUE_SIZE = 2  # When everything goes normal Patroni writes only 2 messages per HA loop
@@ -61,13 +86,16 @@ class PatroniLogger(Thread):
         super(PatroniLogger, self).__init__()
         self._queue_handler = QueueHandler()
         self._root_logger = logging.getLogger()
-        self._root_logger.addHandler(self._queue_handler)
         self._config = None
-        self._log_handler = None
+        self.log_handler = None
+        self.log_handler_lock = Lock()
         self._old_handlers = []
-        self._log_handler_lock = Lock()
         self.reload_config({'level': 'DEBUG'})
-        self.start()
+        # We will switch to the QueueHandler only when thread was started.
+        # This is necessary to protect from the cases when Patroni constructor
+        # failed and PatroniLogger thread remain running and prevent shutdown.
+        self._proxy_handler = ProxyHandler(self)
+        self._root_logger.addHandler(self._proxy_handler)
 
     def update_loggers(self):
         loggers = deepcopy(self._config.get('loggers') or {})
@@ -86,18 +114,22 @@ class PatroniLogger(Thread):
                 self._queue_handler.queue.maxsize = config.get('max_queue_size', self.DEFAULT_MAX_QUEUE_SIZE)
 
             self._root_logger.setLevel(config.get('level', PatroniLogger.DEFAULT_LEVEL))
+            if config.get('traceback_level', PatroniLogger.DEFAULT_TRACEBACK_LEVEL).lower() == 'debug':
+                logging.Logger.exception = debug_exception
+            else:
+                logging.Logger.exception = error_exception
 
             new_handler = None
             if 'dir' in config:
-                if not isinstance(self._log_handler, RotatingFileHandler):
+                if not isinstance(self.log_handler, RotatingFileHandler):
                     new_handler = RotatingFileHandler(os.path.join(config['dir'], __name__))
-                handler = new_handler or self._log_handler
+                handler = new_handler or self.log_handler
                 handler.maxBytes = int(config.get('file_size', 25000000))
                 handler.backupCount = int(config.get('file_num', 4))
             else:
-                if self._log_handler is None or isinstance(self._log_handler, RotatingFileHandler):
+                if self.log_handler is None or isinstance(self.log_handler, RotatingFileHandler):
                     new_handler = logging.StreamHandler()
-                handler = new_handler or self._log_handler
+                handler = new_handler or self.log_handler
 
             oldlogformat = (self._config or {}).get('format', PatroniLogger.DEFAULT_FORMAT)
             logformat = config.get('format', PatroniLogger.DEFAULT_FORMAT)
@@ -109,17 +141,17 @@ class PatroniLogger(Thread):
                 handler.setFormatter(logging.Formatter(logformat, dateformat))
 
             if new_handler:
-                with self._log_handler_lock:
-                    if self._log_handler:
-                        self._old_handlers.append(self._log_handler)
-                    self._log_handler = new_handler
+                with self.log_handler_lock:
+                    if self.log_handler:
+                        self._old_handlers.append(self.log_handler)
+                    self.log_handler = new_handler
 
             self._config = config.copy()
             self.update_loggers()
 
     def _close_old_handlers(self):
         while True:
-            with self._log_handler_lock:
+            with self.log_handler_lock:
                 if not self._old_handlers:
                     break
                 handler = self._old_handlers.pop()
@@ -129,6 +161,11 @@ class PatroniLogger(Thread):
                 _LOGGER.exception('Failed to close the old log handler %s', handler)
 
     def run(self):
+        # switch to QueueHandler only when the thread was started
+        with self.log_handler_lock:
+            self._root_logger.addHandler(self._queue_handler)
+            self._root_logger.removeHandler(self._proxy_handler)
+
         while True:
             self._close_old_handlers()
 
@@ -136,7 +173,7 @@ class PatroniLogger(Thread):
             if record is None:
                 break
 
-            self._log_handler.handle(record)
+            self.log_handler.handle(record)
             self._queue_handler.queue.task_done()
 
     def shutdown(self):

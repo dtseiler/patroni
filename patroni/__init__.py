@@ -4,26 +4,29 @@ import signal
 import sys
 import time
 
+from patroni.version import __version__
+
 logger = logging.getLogger(__name__)
+
+PATRONI_ENV_PREFIX = 'PATRONI_'
 
 
 class Patroni(object):
 
-    def __init__(self):
+    def __init__(self, conf):
         from patroni.api import RestApiServer
-        from patroni.config import Config
         from patroni.dcs import get_dcs
         from patroni.ha import Ha
         from patroni.log import PatroniLogger
         from patroni.postgresql import Postgresql
-        from patroni.version import __version__
+        from patroni.request import PatroniRequest
         from patroni.watchdog import Watchdog
 
         self.setup_signal_handlers()
 
         self.version = __version__
         self.logger = PatroniLogger()
-        self.config = Config()
+        self.config = conf
         self.logger.reload_config(self.config.get('log', {}))
         self.dcs = get_dcs(self.config)
         self.watchdog = Watchdog(self.config)
@@ -31,6 +34,7 @@ class Patroni(object):
 
         self.postgresql = Postgresql(self.config['postgresql'])
         self.api = RestApiServer(self, self.config['restapi'])
+        self.request = PatroniRequest(self.config, True)
         self.ha = Ha(self)
 
         self.tags = self.get_tags()
@@ -66,14 +70,16 @@ class Patroni(object):
     def nosync(self):
         return bool(self.tags.get('nosync', False))
 
-    def reload_config(self):
+    def reload_config(self, sighup=False):
         try:
             self.tags = self.get_tags()
             self.logger.reload_config(self.config.get('log', {}))
-            self.dcs.reload_config(self.config)
             self.watchdog.reload_config(self.config)
+            if sighup:
+                self.request.reload_config(self.config)
             self.api.reload_config(self.config['restapi'])
-            self.postgresql.reload_config(self.config['postgresql'])
+            self.postgresql.reload_config(self.config['postgresql'], sighup)
+            self.dcs.reload_config(self.config)
         except Exception:
             logger.exception('Failed to reload config_file=%s', self.config.config_file)
 
@@ -114,13 +120,16 @@ class Patroni(object):
 
     def run(self):
         self.api.start()
+        self.logger.start()
         self.next_run = time.time()
 
         while not self.received_sigterm:
             if self._received_sighup:
                 self._received_sighup = False
                 if self.config.reload_local_configuration():
-                    self.reload_config()
+                    self.reload_config(True)
+                else:
+                    self.postgresql.config.reload_config(self.config['postgresql'], True)
 
             logger.info(self.ha.run_cycle())
 
@@ -155,7 +164,23 @@ class Patroni(object):
 
 
 def patroni_main():
-    patroni = Patroni()
+    import argparse
+    from patroni.config import Config, ConfigParseError
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--version', action='version', version='%(prog)s {0}'.format(__version__))
+    parser.add_argument('configfile', nargs='?', default='',
+                        help='Patroni may also read the configuration from the {0} environment variable'
+                        .format(Config.PATRONI_CONFIG_VARIABLE))
+    args = parser.parse_args()
+    try:
+        conf = Config(args.configfile)
+    except ConfigParseError as e:
+        if e.value:
+            print(e.value)
+        parser.print_help()
+        sys.exit(1)
+    patroni = Patroni(conf)
     try:
         patroni.run()
     except KeyboardInterrupt:
@@ -191,8 +216,8 @@ def check_psycopg2():
 
 
 def main():
-    check_psycopg2()
     if os.getpid() != 1:
+        check_psycopg2()
         return patroni_main()
 
     # Patroni started with PID=1, it looks like we are in the container

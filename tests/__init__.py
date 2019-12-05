@@ -1,14 +1,12 @@
 import datetime
-import json
 import os
 import shutil
 import unittest
 
 from mock import Mock, patch
-from tempfile import gettempdir
 
 import psycopg2
-import requests
+import urllib3
 
 from patroni.dcs import Leader, Member
 from patroni.postgresql import Postgresql
@@ -25,18 +23,10 @@ class MockResponse(object):
     def __init__(self, status_code=200):
         self.status_code = status_code
         self.content = '{}'
-        self.ok = True
-
-    def json(self):
-        return json.loads(self.content)
 
     @property
     def data(self):
         return self.content.encode('utf-8')
-
-    @property
-    def text(self):
-        return self.content
 
     @property
     def status(self):
@@ -52,7 +42,7 @@ def requests_get(url, **kwargs):
               '"name":"default","clientURLs":["http://localhost:2379","http://localhost:4001"]}]'
     response = MockResponse()
     if url.startswith('http://local'):
-        raise requests.exceptions.RequestException()
+        raise urllib3.exceptions.HTTPError()
     elif ':8011/patroni' in url:
         response.content = '{"role": "replica", "xlog": {"received_location": 0}, "tags": {}}'
     elif url.endswith('/members'):
@@ -63,11 +53,9 @@ def requests_get(url, **kwargs):
         data = kwargs.get('data', '')
         if ' false}' in data:
             response.status_code = 503
-            response.ok = False
             response.content = 'restarting after failure already in progress'
     else:
         response.status_code = 404
-        response.ok = False
     return response
 
 
@@ -101,12 +89,15 @@ class MockCursor(object):
             self.results = [(1, 2)]
         elif sql.startswith('SELECT pg_catalog.pg_is_in_recovery()'):
             self.results = [(False, 2)]
-        elif sql.startswith('WITH replication_info AS ('):
+        elif sql.startswith('SELECT pg_catalog.to_char'):
             replication_info = '[{"application_name":"walreceiver","client_addr":"1.2.3.4",' +\
                                '"state":"streaming","sync_state":"async","sync_priority":0}]'
             self.results = [('', 0, '', '', '', '', False, replication_info)]
         elif sql.startswith('SELECT name, setting'):
             self.results = [('wal_segment_size', '2048', '8kB', 'integer', 'internal'),
+                            ('wal_block_size', '8192', None, 'integer', 'internal'),
+                            ('shared_buffers', '16384', '8kB', 'integer', 'postmaster'),
+                            ('wal_buffers', '-1', '8kB', 'integer', 'postmaster'),
                             ('search_path', 'public', None, 'string', 'user'),
                             ('port', '5433', None, 'integer', 'postmaster'),
                             ('listen_addresses', '*', None, 'string', 'postmaster'),
@@ -179,11 +170,12 @@ class PostgresInit(unittest.TestCase):
     @patch.object(ConfigHandler, 'write_postgresql_conf', Mock())
     @patch.object(ConfigHandler, 'replace_pg_hba', Mock())
     @patch.object(ConfigHandler, 'replace_pg_ident', Mock())
+    @patch.object(Postgresql, 'get_postgres_role_from_data_directory', Mock(return_value='master'))
     def setUp(self):
-        data_dir = 'data/test0'
+        data_dir = os.path.join('data', 'test0')
         self.p = Postgresql({'name': 'postgresql0', 'scope': 'batman', 'data_dir': data_dir,
                              'config_dir': data_dir, 'retry_timeout': 10,
-                             'krbsrvname': 'postgres', 'pgpass': os.path.join(gettempdir(), 'pgpass0'),
+                             'krbsrvname': 'postgres', 'pgpass': os.path.join(data_dir, 'pgpass0'),
                              'listen': '127.0.0.2, 127.0.0.3:5432', 'connect_address': '127.0.0.2:5432',
                              'authentication': {'superuser': {'username': 'foo', 'password': 'test'},
                                                 'replication': {'username': '', 'password': 'rep-pass'}},
